@@ -19,7 +19,14 @@ logging.basicConfig(level=logging.INFO)
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
-MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+# моделі пробуються по черзі: якщо перша перевантажена (503), бере наступну
+MODELS = [
+    m.strip()
+    for m in os.getenv(
+        "GEMINI_MODELS", "gemini-3.8-flash,gemini-3.5-flash,gemini-3.1-flash-lite"
+    ).split(",")
+    if m.strip()
+]
 ALLOWED_IDS = {int(x) for x in os.getenv("ALLOWED_IDS", "").split(",") if x.strip()}
 PREVIEW_LEN = 1000
 
@@ -105,13 +112,41 @@ async def deny(message: Message):
 
 def err_text(e: Exception) -> str:
     s = str(e)
+    if "503" in s or "UNAVAILABLE" in s:
+        return "Gemini зараз перевантажений. Спробуй ще раз за хвилину."
     if "429" in s or "RESOURCE_EXHAUSTED" in s:
         return "Ліміт Gemini на зараз вичерпано. Спробуй через хвилину."
     if "API key" in s or "403" in s or "401" in s:
         return "Gemini не прийняв ключ. Перевір GEMINI_API_KEY у Railway."
     if "404" in s or "NOT_FOUND" in s:
-        return f"Модель {MODEL} недоступна. Задай іншу в змінній GEMINI_MODEL."
+        return "Модель недоступна. Задай інші у змінній GEMINI_MODELS."
     return "Щось пішло не так. Спробуй ще раз."
+
+
+RETRYABLE = ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "500", "INTERNAL", "504", "DEADLINE")
+
+
+async def generate(contents, config=None):
+    """Запит до Gemini: 2 спроби на кожну модель, далі наступна модель зі списку."""
+    last: Exception | None = None
+    for model in MODELS:
+        for attempt in range(2):
+            try:
+                resp = await client.aio.models.generate_content(
+                    model=model, contents=contents, config=config
+                )
+                return resp
+            except Exception as e:
+                last = e
+                s = str(e)
+                logging.warning("Gemini %s спроба %d: %s", model, attempt + 1, s[:200])
+                if not any(k in s for k in RETRYABLE):
+                    if "404" in s or "NOT_FOUND" in s:
+                        break  # цієї моделі нема, йдемо до наступної
+                    raise
+                if attempt == 0:
+                    await asyncio.sleep(2)
+    raise last
 
 
 # ---------- допоміжне ----------
@@ -158,12 +193,11 @@ async def transcribe(message: Message) -> str:
         media, mime = message.video, "video/mp4"
     buf = io.BytesIO()
     await bot.download(media, destination=buf)
-    resp = await client.aio.models.generate_content(
-        model=MODEL,
-        contents=[
+    resp = await generate(
+        [
             types.Part.from_bytes(data=buf.getvalue(), mime_type=mime),
             TRANSCRIBE_PROMPT,
-        ],
+        ]
     )
     return (resp.text or "").strip()
 
@@ -173,10 +207,9 @@ async def run_format(source: str, fmt: str, extra: str = "") -> str:
     content = f"Вихідний текст:\n{source}"
     if extra:
         content += f"\n\nВідповідь на уточнювальні питання:\n{extra}"
-    resp = await client.aio.models.generate_content(
-        model=MODEL,
-        contents=content,
-        config=types.GenerateContentConfig(system_instruction=system, temperature=0.7),
+    resp = await generate(
+        content,
+        types.GenerateContentConfig(system_instruction=system, temperature=0.7),
     )
     return (resp.text or "").strip()
 
@@ -310,7 +343,7 @@ async def on_full(cb: CallbackQuery):
 
 async def main():
     me = await bot.get_me()
-    logging.info("Бот @%s запущено, модель %s", me.username, MODEL)
+    logging.info("Бот @%s запущено, моделі %s", me.username, MODELS)
     await bot.delete_webhook(drop_pending_updates=False)
     await dp.start_polling(bot)
 
