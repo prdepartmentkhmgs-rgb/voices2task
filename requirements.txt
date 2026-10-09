@@ -1,3 +1,2 @@
 aiogram>=3.13
-anthropic>=0.40
-openai>=1.50
+google-genai>=1.0
