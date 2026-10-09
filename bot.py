@@ -1,7 +1,7 @@
 import asyncio
+import io
 import logging
 import os
-import tempfile
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
@@ -12,21 +12,18 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     Message,
 )
-from anthropic import AsyncAnthropic
-from openai import AsyncOpenAI
+from google import genai
+from google.genai import types
 
 logging.basicConfig(level=logging.INFO)
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
-OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]  # тільки для розшифровки голосових
-CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-5-5")
-TRANSCRIBE_MODEL = os.getenv("TRANSCRIBE_MODEL", "gpt-4o-transcribe")
+GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 ALLOWED_IDS = {int(x) for x in os.getenv("ALLOWED_IDS", "").split(",") if x.strip()}
 PREVIEW_LEN = 1000
 
-claude = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
-openai = AsyncOpenAI(api_key=OPENAI_API_KEY)
+client = genai.Client(api_key=GEMINI_API_KEY)
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 
@@ -37,6 +34,12 @@ BASE_RULES = """Ти перетворюєш розшифровку голосо�
 Прибирай слова-паразити, повтори, самопоправки.
 Без штампів, пафосу, канцеляризмів і «AI-тону». Без емодзі. Без вступів на кшталт «Ось ваш текст».
 Віддай тільки готовий результат."""
+
+TRANSCRIBE_PROMPT = (
+    "Розшифруй це аудіо дослівно, мовою оригіналу (зазвичай українська). "
+    "Став розділові знаки. Не додавай жодних коментарів, заголовків чи пояснень, "
+    "поверни тільки текст розшифровки."
+)
 
 FORMATS = {
     "msg": {
@@ -96,6 +99,21 @@ def allowed(uid: int) -> bool:
     return not ALLOWED_IDS or uid in ALLOWED_IDS
 
 
+async def deny(message: Message):
+    await message.answer(f"Бот приватний. Твій Telegram ID: {message.from_user.id}")
+
+
+def err_text(e: Exception) -> str:
+    s = str(e)
+    if "429" in s or "RESOURCE_EXHAUSTED" in s:
+        return "Ліміт Gemini на зараз вичерпано. Спробуй через хвилину."
+    if "API key" in s or "403" in s or "401" in s:
+        return "Gemini не прийняв ключ. Перевір GEMINI_API_KEY у Railway."
+    if "404" in s or "NOT_FOUND" in s:
+        return f"Модель {MODEL} недоступна. Задай іншу в змінній GEMINI_MODEL."
+    return "Щось пішло не так. Спробуй ще раз."
+
+
 # ---------- допоміжне ----------
 
 async def send_long(message: Message, text: str, **kw):
@@ -130,16 +148,24 @@ async def show_menu(message: Message, text: str):
 
 
 async def transcribe(message: Message) -> str:
-    media = message.voice or message.audio or message.video_note or message.video
-    ext = ".ogg" if message.voice else ".mp4" if (message.video_note or message.video) else ".mp3"
-    tg_file = await bot.get_file(media.file_id)
-    with tempfile.NamedTemporaryFile(suffix=ext) as tmp:
-        await bot.download_file(tg_file.file_path, destination=tmp.name)
-        with open(tmp.name, "rb") as f:
-            res = await openai.audio.transcriptions.create(
-                model=TRANSCRIBE_MODEL, file=f, language="uk"
-            )
-    return res.text.strip()
+    if message.voice:
+        media, mime = message.voice, "audio/ogg"
+    elif message.audio:
+        media, mime = message.audio, message.audio.mime_type or "audio/mpeg"
+    elif message.video_note:
+        media, mime = message.video_note, "video/mp4"
+    else:
+        media, mime = message.video, "video/mp4"
+    buf = io.BytesIO()
+    await bot.download(media, destination=buf)
+    resp = await client.aio.models.generate_content(
+        model=MODEL,
+        contents=[
+            types.Part.from_bytes(data=buf.getvalue(), mime_type=mime),
+            TRANSCRIBE_PROMPT,
+        ],
+    )
+    return (resp.text or "").strip()
 
 
 async def run_format(source: str, fmt: str, extra: str = "") -> str:
@@ -147,19 +173,26 @@ async def run_format(source: str, fmt: str, extra: str = "") -> str:
     content = f"Вихідний текст:\n{source}"
     if extra:
         content += f"\n\nВідповідь на уточнювальні питання:\n{extra}"
-    resp = await claude.messages.create(
-        model=CLAUDE_MODEL,
-        max_tokens=2000,
-        system=system,
-        messages=[{"role": "user", "content": content}],
+    resp = await client.aio.models.generate_content(
+        model=MODEL,
+        contents=content,
+        config=types.GenerateContentConfig(system_instruction=system, temperature=0.7),
     )
-    return resp.content[0].text.strip()
+    return (resp.text or "").strip()
 
 
 async def deliver(message: Message, uid: int, fmt: str, extra: str = ""):
     state = st(uid)
     await bot.send_chat_action(message.chat.id, "typing")
-    result = await run_format(state["text"], fmt, extra)
+    try:
+        result = await run_format(state["text"], fmt, extra)
+    except Exception as e:
+        logging.exception("format failed")
+        await message.answer(err_text(e))
+        return
+    if not result:
+        await message.answer("Модель повернула порожню відповідь. Спробуй ще раз.")
+        return
     if fmt == "task" and result.startswith("БРАКУЄ"):
         state["pending"] = {"fmt": fmt}
         await send_long(message, result)
@@ -173,6 +206,7 @@ async def deliver(message: Message, uid: int, fmt: str, extra: str = ""):
 @dp.message(CommandStart())
 async def start(message: Message):
     if not allowed(message.from_user.id):
+        await deny(message)
         return
     await message.answer(
         "Кидай голосове або текст, розшифрую й оформлю.\n\n"
@@ -210,13 +244,14 @@ async def handle_input(message: Message, text: str):
 @dp.message(F.voice | F.audio | F.video_note | F.video)
 async def on_media(message: Message):
     if not allowed(message.from_user.id):
+        await deny(message)
         return
     await bot.send_chat_action(message.chat.id, "typing")
     try:
         text = await transcribe(message)
-    except Exception:
+    except Exception as e:
         logging.exception("transcribe failed")
-        await message.answer("Не вдалося розпізнати. Спробуй ще раз або кинь текстом.")
+        await message.answer(err_text(e))
         return
     if not text:
         await message.answer("Розшифровка порожня. Перевір, чи є звук у записі.")
@@ -227,6 +262,7 @@ async def on_media(message: Message):
 @dp.message(F.text & ~F.text.startswith("/"))
 async def on_text(message: Message):
     if not allowed(message.from_user.id):
+        await deny(message)
         return
     await handle_input(message, message.text.strip())
 
@@ -235,6 +271,7 @@ async def on_text(message: Message):
 async def on_format(cb: CallbackQuery):
     uid = cb.from_user.id
     if not allowed(uid):
+        await cb.answer("Немає доступу", show_alert=True)
         return
     state = st(uid)
     if not state["text"]:
@@ -246,6 +283,9 @@ async def on_format(cb: CallbackQuery):
 
 @dp.callback_query(F.data == "add")
 async def on_add(cb: CallbackQuery):
+    if not allowed(cb.from_user.id):
+        await cb.answer("Немає доступу", show_alert=True)
+        return
     st(cb.from_user.id)["adding"] = True
     await cb.answer()
     await cb.message.answer("Кидай ще голосове або текст, додам до попереднього.")
@@ -253,9 +293,14 @@ async def on_add(cb: CallbackQuery):
 
 @dp.callback_query(F.data == "full")
 async def on_full(cb: CallbackQuery):
+    if not allowed(cb.from_user.id):
+        await cb.answer("Немає доступу", show_alert=True)
+        return
     text = st(cb.from_user.id)["text"]
     await cb.answer()
-    if len(text) <= 4000:
+    if not text:
+        await cb.message.answer("Поки нема що показувати. Кинь голосове або текст.")
+    elif len(text) <= 4000:
         await cb.message.answer(text)
     else:
         await cb.message.answer_document(
@@ -264,6 +309,9 @@ async def on_full(cb: CallbackQuery):
 
 
 async def main():
+    me = await bot.get_me()
+    logging.info("Бот @%s запущено, модель %s", me.username, MODEL)
+    await bot.delete_webhook(drop_pending_updates=False)
     await dp.start_polling(bot)
 
 
